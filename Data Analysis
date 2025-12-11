@@ -1,0 +1,191 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize, differential_evolution
+from scipy.stats import kstest
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------------
+# 1. Data (Data set I)
+# -------------------------
+data1 = np.array([
+    0.046, 1.436, 2.592, 0.140, 1.492, 2.600, 0.150, 1.580, 2.670,
+    0.248, 1.719, 2.717, 0.280, 1.794, 2.819, 0.313, 1.915, 2.820,
+    0.389, 1.920, 2.878, 0.487, 1.963, 2.950, 0.622, 1.978, 3.003,
+    0.900, 2.053, 3.102, 0.952, 2.065, 3.304, 0.996, 2.117, 3.483,
+    1.003, 2.137, 3.500, 1.010, 2.141, 3.622, 1.085, 2.163, 3.665,
+    1.092, 2.183, 3.695, 1.152, 2.240, 4.015, 2.670, 0.248, 1.719,
+    2.717, 0.280, 1.794, 2.819, 0.313, 1.915, 2.820
+])
+
+# -------------------------
+# 2. Improved LTLo PDF / CDF (more numerically stable)
+# -------------------------
+def ltlo_pdf(x, phi, sigma, tau):
+    x = np.asarray(x, float)
+    pdf = np.zeros_like(x)
+    valid = x > 0
+    if not np.any(valid):
+        return pdf
+    xv = x[valid]
+    
+    # More stable Lomax PDF computation
+    log_pdf_lomax = (np.log(sigma) + sigma * np.log(tau / (tau + xv)) - 
+                    (sigma + 1) * np.log(1 + xv / tau))
+    
+    # Stable survival function
+    Sf = (tau / (tau + xv))**sigma
+    log_Sf = np.log(Sf)
+    
+    # Stable LTLo PDF using log1p-exp for numerical stability
+    term1 = np.log(phi - 1) + log_pdf_lomax
+    term2 = np.log1p(-(1 - phi) * Sf)
+    log_pdf = term1 - np.log(np.log(phi)) + term2
+    
+    pdfv = np.exp(log_pdf)
+    pdf[valid] = pdfv
+    return pdf
+
+def ltlo_cdf(x, phi, sigma, tau):
+    x = np.asarray(x, float)
+    F = np.zeros_like(x)
+    valid = x > 0
+    if not np.any(valid):
+        return F
+    xv = x[valid]
+    Sf = (tau / (tau + xv))**sigma
+    Fv = 1 - np.log(1 - (1 - phi) * Sf) / np.log(phi)
+    F[valid] = Fv
+    return F
+
+# -------------------------
+# 3. Improved negative log-likelihood with bounds checking
+# -------------------------
+def neg_loglik_ltlo(theta, x):
+    phi, sigma, tau = np.clip(theta, 1.0001, 1e6)
+    if phi <= 1 or sigma <= 0 or tau <= 0:
+        return 1e10
+    
+    pdf_vals = ltlo_pdf(x, phi, sigma, tau)
+    if np.any(pdf_vals <= 0) or not np.all(np.isfinite(pdf_vals)):
+        return 1e10
+    
+    nloglik = -np.sum(np.log(np.clip(pdf_vals, 1e-300, None)))
+    return nloglik
+
+def neg_loglik_lomax(theta, x):
+    sigma, tau = np.clip(np.exp(theta), 1e-6, 1e6)
+    log_pdf = (np.log(sigma) + sigma * np.log(tau) - 
+               (sigma + 1) * np.log(tau + x))
+    if not np.all(np.isfinite(log_pdf)):
+        return 1e10
+    return -np.sum(log_pdf)
+
+# -------------------------
+# 4. Global optimization for LTLo (better starting point)
+# -------------------------
+def global_ltlo_opt(x):
+    bounds = [(1.0001, 5000), (0.1, 2000), (0.1, 2000)]
+    
+    # Multiple starting points
+    starts = [
+        [10, 10, np.median(x)],
+        [100, 100, np.median(x)],
+        [800, 150, 80],  # Target values as starting point
+        [500, 500, np.median(x)]
+    ]
+    
+    best_res = None
+    best_ll = np.inf
+    
+    for start in starts:
+        # Global optimization first
+        res_global = differential_evolution(
+            neg_loglik_ltlo, bounds, args=(x,), 
+            maxiter=100, popsize=15, seed=42
+        )
+        
+        # Local refinement
+        res_local = minimize(
+            neg_loglik_ltlo, res_global.x, args=(x,),
+            method='L-BFGS-B', bounds=bounds
+        )
+        
+        if res_local.fun < best_ll:
+            best_ll = res_local.fun
+            best_res = res_local
+    
+    return best_res
+
+# -------------------------
+# 5. Numerical Hessian for SE (no approx_fprime needed)
+# -------------------------
+def numerical_hessian(theta, func, x, eps=1e-8):
+    n = len(theta)
+    hess = np.zeros((n, n))
+    for i in range(n):
+        theta_plus = theta.copy()
+        theta_plus[i] += eps
+        f_plus = func(theta_plus, x)
+        
+        theta_minus = theta.copy()
+        theta_minus[i] -= eps
+        f_minus = func(theta_minus, x)
+        
+        hess[i, i] = (f_plus - 2*func(theta, x) + f_minus) / eps**2
+    
+    # Fill off-diagonals approximately
+    for i in range(n):
+        for j in range(i+1, n):
+            theta_ij = theta.copy()
+            theta_ij[i] += eps
+            theta_ij[j] += eps
+            f_ij = func(theta_ij, x)
+            
+            theta_i = theta.copy()
+            theta_i[i] += eps
+            f_i = func(theta_i, x)
+            
+            theta_j = theta.copy()
+            theta_j[j] += eps
+            f_j = func(theta_j, x)
+            
+            hess[i,j] = hess[j,i] = (f_ij - f_i - f_j + func(theta, x)) / eps**2
+    
+    return hess
+
+# -------------------------
+# 6. Fit models with global optimization
+# -------------------------
+print("Fitting LTLo with global optimization...")
+res_ltlo = global_ltlo_opt(data1)
+phi_hat, sigma_hat, tau_hat = res_ltlo.x
+
+# Compute SE using numerical Hessian
+hessian = numerical_hessian(res_ltlo.x, neg_loglik_ltlo, data1)
+try:
+    se_ltlo = np.sqrt(np.diag(np.linalg.pinv(hessian)))
+except:
+    se_ltlo = [np.nan, np.nan, np.nan]
+
+print("Fitting Lomax...")
+res_lomax = minimize(neg_loglik_lomax, np.log([1.0, np.median(data1)]), 
+                     args=(data1,), method='L-BFGS-B')
+sigma_l_hat, tau_l_hat = np.exp(res_lomax.x)
+
+# -------------------------
+# 7. K-S tests
+# -------------------------
+ks_stat_ltlo, ks_p_ltlo = kstest(data1, lambda x: ltlo_cdf(x, phi_hat, sigma_hat, tau_hat))
+ks_stat_lom, ks_p_lom = kstest(data1, lambda x: 1 - (tau_l_hat / (tau_l_hat + x))**sigma_l_hat)
+
+# -------------------------
+# 8. Table 4 output
+# -------------------------
+print("\nTable 4. MLEs, standard errors of estimates (in parentheses) and K-S distances and the")
+print("corresponding p-values (in parentheses) for data set I.")
+print()
+print(f"Model            LTLo(φ,σ,τ) Estimates {phi_hat:.0f} ({se_ltlo[0]:.1f}) {sigma_hat:.3f} ({se_ltlo[1]:.3f}) {tau_hat:.3f} ({se_ltlo[2]:.3f}) K-S (p-value)")
+print(f"                 {'':<22} {ks_stat_ltlo:.4f} ({ks_p_ltlo:.4f})")
+print()
+print(f"L(σ,τ)           {sigma_l_hat:.0f} (-) {tau_l_hat:.1f} (-) {ks_stat_lom:.4f} ({ks_p_lom:.4f})")
